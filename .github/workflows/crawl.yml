@@ -44,6 +44,10 @@ jobs:
             echo "⚠ No ITVIEC_COOKIES_RAW secret — scraping không login, salary sẽ bị ẩn."
           fi
 
+      # Luôn fresh scrape trên CI — không dùng resume từ state file cũ
+      - name: Ensure fresh state
+        run: rm -f itviec-state.json
+
       - name: Crawl
         run: node scraper.js
 
