@@ -123,6 +123,15 @@
     .rep-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
     .rep-list .bar-row { cursor: default; }
     .rep-list .bar-row:hover { background: transparent; }
+
+    /* Vertical column chart cho salary distribution */
+    .salary-chart { display: flex; gap: 6px; margin-top: 10px; }
+    .salary-chart .col { flex: 1; display: flex; flex-direction: column; align-items: center; min-width: 0; }
+    .salary-chart .count { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; height: 16px; line-height: 16px; }
+    .salary-chart .col-bar { width: 100%; max-width: 44px; height: 160px; display: flex; align-items: flex-end; }
+    .salary-chart .bar { width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; transition: filter 0.1s; min-height: 1px; }
+    .salary-chart .col:hover .bar { filter: brightness(1.15); }
+    .salary-chart .label { font-size: 11px; color: var(--muted); margin-top: 8px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -217,20 +226,108 @@ python -m http.server 8000</pre>
     };
 
     // ============ parsers ============
-    // "1,100 - 2,000 USD" | "500 - 600 USD" | "Up to 3,000 USD"
+    // Tỉ giá USD→VND lấy từ @fawazahmed0/currency-api (free, CDN qua jsDelivr);
+    // cache 6h trong localStorage; fallback 25,000 nếu offline/API fail.
+    const RATE_CACHE_KEY = 'itviec-dashboard.usdvnd';
+    const RATE_CACHE_TTL_MS = 6 * 3600 * 1000;
+    let usdVndRate = 25000;             // VND cần để đổi 1 USD
+    let USD_PER_VND = 1 / usdVndRate;   // dùng cho tính toán
+    let rateSource = 'fallback';        // 'api' | 'cache' | 'fallback'
+    let rateFetchedAt = null;
+
+    async function loadRate() {
+      try {
+        const cachedRaw = localStorage.getItem(RATE_CACHE_KEY);
+        if (cachedRaw) {
+          const cached = JSON.parse(cachedRaw);
+          if (cached && typeof cached.rate === 'number' && Date.now() - cached.at < RATE_CACHE_TTL_MS) {
+            usdVndRate = cached.rate;
+            USD_PER_VND = 1 / cached.rate;
+            rateSource = 'cache';
+            rateFetchedAt = new Date(cached.at);
+            return;
+          }
+        }
+        const res = await fetch('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const rate = data?.usd?.vnd;
+        if (typeof rate === 'number' && rate > 0) {
+          usdVndRate = rate;
+          USD_PER_VND = 1 / rate;
+          rateSource = 'api';
+          rateFetchedAt = new Date();
+          localStorage.setItem(RATE_CACHE_KEY, JSON.stringify({ rate, at: Date.now() }));
+        }
+      } catch (err) {
+        console.warn('[rate] fetch failed, using fallback 25,000:', err.message);
+        rateSource = 'fallback';
+      }
+    }
+
+    // Parse salary string với nhiều format:
+    //   USD: "1,100 - 2,000 USD", "Up to 2400$", "From $1300", "Up-to 34,000 usd/year"
+    //   VND: "30,000,000 - 50,000,000đ", "Up to 35m", "60-80 triệu", "20-25tr gross",
+    //        "Upto 70.000.000 vnđ", "18,000,000-30,000,000" (raw)
+    //   Skip: "Thỏa thuận", "Negotiable", "You'll love it", "Very attractive!!!", ...
+    // Trả về { min, max, currency, minUSD, maxUSD } hoặc null.
     function parseSalary(s) {
       if (!s) return null;
-      if (/sign in|love it|will love|negotiable|attractive|competitive/i.test(s)) return null;
-      const upTo = s.match(/up\s*to\s*(\d[\d,]*)/i);
-      if (upTo) return { min: 0, max: parseInt(upTo[1].replace(/,/g, '')) };
-      const range = s.match(/(\d[\d,]*)\s*-\s*(\d[\d,]*)/);
+      if (/sign in|love it|negotiab|negotiat|attractive|competitive|thỏa thuận|best in|full bhxh|surely love|lương cao/i.test(s)) return null;
+
+      const isUSD = /USD|usd|\$/.test(s);
+      const isVND = /VND|vnd|vnđ|đ\b|đ$|đ\s|đồng/i.test(s);
+      const hasM = /\d\s*m\b/i.test(s);
+      const hasTr = /\d\s*tr\b/i.test(s);
+      const hasTrieu = /triệu/i.test(s);
+      const hasMillion = hasM || hasTr || hasTrieu;
+
+      let currency = isUSD ? 'USD' : ((isVND || hasMillion) ? 'VND' : null);
+
+      // Chuẩn hoá chuỗi để extract số
+      let str = s.replace(/USD|usd|VND|vnd|vnđ|đồng|triệu|\$|\(.*?\)|gross/gi, ' ');
+      str = str.replace(/đ/g, ' ');
+      str = str.replace(/(\d)\s*m\b/gi, '$1');
+      str = str.replace(/(\d)\s*tr\b/gi, '$1');
+      // Dotted thousands VND: "70.000.000" → "70000000"
+      while (/\d\.\d{3}/.test(str)) str = str.replace(/(\d)\.(\d{3})/g, '$1$2');
+
+      const perYear = /\/year|per\s*year|annually/i.test(s);
+
+      let min = null, max = null;
+      const range = str.match(/([\d,]+)\s*(?:-|to)\s*([\d,]+)/i);
+      const upTo = str.match(/(?:up\s*[-\s]*to|upto)\s*([\d,]+)/i);
+      const from = str.match(/from\s*([\d,]+)/i);
+
       if (range) {
-        return {
-          min: parseInt(range[1].replace(/,/g, '')),
-          max: parseInt(range[2].replace(/,/g, '')),
-        };
+        min = parseInt(range[1].replace(/,/g, ''));
+        max = parseInt(range[2].replace(/,/g, ''));
+      } else if (upTo) {
+        min = 0;
+        max = parseInt(upTo[1].replace(/,/g, ''));
+      } else if (from) {
+        min = parseInt(from[1].replace(/,/g, ''));
+        max = min;
+      } else {
+        return null;
       }
-      return null;
+
+      if (hasMillion) {
+        min *= 1_000_000;
+        max *= 1_000_000;
+        currency = 'VND';
+      }
+      if (!currency) currency = max >= 1_000_000 ? 'VND' : 'USD';
+
+      if (perYear) {
+        min = Math.round(min / 12);
+        max = Math.round(max / 12);
+      }
+
+      const minUSD = currency === 'VND' ? Math.round(min * USD_PER_VND) : min;
+      const maxUSD = currency === 'VND' ? Math.round(max * USD_PER_VND) : max;
+
+      return { min, max, currency, minUSD, maxUSD };
     }
 
     function normalizeMode(s) {
@@ -294,6 +391,20 @@ python -m http.server 8000</pre>
 
     function fmtUSD(n) { return n.toLocaleString('en-US'); }
 
+    function relativeFrom(date) {
+      if (!date) return '';
+      const minutes = (Date.now() - date.getTime()) / 60000;
+      if (minutes < 1) return 'vừa xong';
+      if (minutes < 60) return `${Math.round(minutes)} phút trước`;
+      const hours = minutes / 60;
+      if (hours < 24) return `${Math.round(hours)} giờ trước`;
+      const days = hours / 24;
+      if (days < 30) return `${Math.round(days)} ngày trước`;
+      const months = days / 30;
+      if (months < 12) return `${Math.round(months)} tháng trước`;
+      return `${Math.round(months / 12)} năm trước`;
+    }
+
     // ============ filter + sort ============
     function filtered() {
       const { q, location, mode, quick, skill, company } = state.filter;
@@ -320,7 +431,7 @@ python -m http.server 8000</pre>
       } else if (state.sort === 'salary') {
         c.sort((a, b) => {
           const sa = parseSalary(a.salary), sb = parseSalary(b.salary);
-          return (sb?.max ?? -1) - (sa?.max ?? -1);
+          return (sb?.maxUSD ?? -1) - (sa?.maxUSD ?? -1);
         });
       } else if (state.sort === 'title') {
         c.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
@@ -334,16 +445,34 @@ python -m http.server 8000</pre>
       const companies = new Set(jobs.map(j => j.company).filter(Boolean));
       const locations = new Set(jobs.map(j => j.location).filter(Boolean));
       const withSal = jobs.map(j => parseSalary(j.salary)).filter(Boolean);
-      const avgMax = withSal.length ? Math.round(withSal.reduce((a, s) => a + s.max, 0) / withSal.length) : null;
+      const usdCount = withSal.filter(s => s.currency === 'USD').length;
+      const vndCount = withSal.filter(s => s.currency === 'VND').length;
+      const avgMaxUSD = withSal.length ? Math.round(withSal.reduce((a, s) => a + s.maxUSD, 0) / withSal.length) : null;
       const hot = jobs.filter(j => /hot/i.test(j.label || '')).length;
+
+      // Crawl time: lấy scrapedAt mới nhất trong jobs
+      const scrapedTimes = jobs.map(j => j.scrapedAt ? new Date(j.scrapedAt) : null).filter(Boolean);
+      const latestScrape = scrapedTimes.length
+        ? scrapedTimes.reduce((a, b) => a > b ? a : b)
+        : null;
 
       const cards = [
         { label: 'Total jobs', value: jobs.length },
         { label: 'Companies', value: companies.size },
         { label: 'Locations', value: locations.size },
-        { label: 'With salary', value: withSal.length, sub: jobs.length ? `${Math.round(withSal.length / jobs.length * 100)}%` : '' },
-        { label: 'Avg max salary', value: avgMax ? `$${fmtUSD(avgMax)}` : '—', sub: avgMax ? 'USD (parsed)' : '' },
+        { label: 'With salary', value: withSal.length, sub: jobs.length ? `${Math.round(withSal.length / jobs.length * 100)}% · USD:${usdCount} VND:${vndCount}` : '' },
+        { label: 'Avg max salary', value: avgMaxUSD ? `$${fmtUSD(avgMaxUSD)}` : '—', sub: avgMaxUSD ? 'USD-equiv' : '' },
         { label: 'HOT', value: hot },
+        {
+          label: 'Last crawl',
+          value: latestScrape ? fmtDateTime(latestScrape) : '—',
+          sub: latestScrape ? relativeFrom(latestScrape) : '',
+        },
+        {
+          label: 'USD → VND',
+          value: fmtUSD(Math.round(usdVndRate)),
+          sub: `${rateSource}${rateFetchedAt ? ' · ' + rateFetchedAt.toISOString().slice(0, 10) : ''}`,
+        },
       ];
       document.getElementById('stats').innerHTML = cards.map(c =>
         `<div class="stat"><div class="stat-label">${esc(c.label)}</div><div class="stat-value">${esc(c.value)}</div>${c.sub ? `<div class="stat-sub">${esc(c.sub)}</div>` : ''}</div>`
@@ -448,14 +577,23 @@ python -m http.server 8000</pre>
     }
 
     // ============ report ============
-    const SALARY_BUCKETS = [
-      { label: '< $500',      min: 0,    max: 500 },
-      { label: '$500 – $1k',  min: 500,  max: 1000 },
-      { label: '$1k – $2k',   min: 1000, max: 2000 },
-      { label: '$2k – $3k',   min: 2000, max: 3000 },
-      { label: '$3k – $5k',   min: 3000, max: 5000 },
-      { label: '≥ $5k',       min: 5000, max: Infinity },
-    ];
+    // Salary buckets với bước nhảy $500, từ $0 đến $5k + overflow ≥$5k (11 buckets).
+    // label = nhãn dài (cho markdown), short = nhãn ngắn (cho column chart X-axis).
+    const SALARY_BUCKETS = (() => {
+      const step = 500, cap = 5000, arr = [];
+      const fmt = n => n < 1000 ? `${n}` : (n % 1000 === 0 ? `${n / 1000}k` : `${(n / 1000).toFixed(1)}k`);
+      for (let lo = 0; lo < cap; lo += step) {
+        const hi = lo + step;
+        arr.push({
+          label: `$${fmt(lo)} – $${fmt(hi)}`,
+          short: `$${fmt(lo)}`,
+          min: lo,
+          max: hi,
+        });
+      }
+      arr.push({ label: `≥ $${fmt(cap)}`, short: `$${fmt(cap)}+`, min: cap, max: Infinity });
+      return arr;
+    })();
     const FRESH_BUCKETS = [
       { label: 'Today (< 24h)',  maxMin: 1440 },
       { label: 'This week',      maxMin: 10080 },
@@ -468,10 +606,10 @@ python -m http.server 8000</pre>
       const list = filtered();
       const total = list.length;
 
-      // Salary
+      // Salary — mọi số đã normalize về USD qua parseSalary.maxUSD/minUSD
       const salaries = list.map(j => parseSalary(j.salary)).filter(Boolean);
-      const maxes = salaries.map(s => s.max).sort((a, b) => a - b);
-      const mins = salaries.map(s => s.min).sort((a, b) => a - b);
+      const maxes = salaries.map(s => s.maxUSD).sort((a, b) => a - b);
+      const mins = salaries.map(s => s.minUSD).sort((a, b) => a - b);
       const median = maxes.length
         ? (maxes.length % 2
           ? maxes[(maxes.length - 1) / 2]
@@ -480,8 +618,10 @@ python -m http.server 8000</pre>
       const avg = maxes.length ? Math.round(maxes.reduce((a, b) => a + b, 0) / maxes.length) : null;
       const salBuckets = SALARY_BUCKETS.map(b => ({
         ...b,
-        count: salaries.filter(s => s.max >= b.min && s.max < b.max).length,
+        count: salaries.filter(s => s.maxUSD >= b.min && s.maxUSD < b.max).length,
       }));
+      const usdCount = salaries.filter(s => s.currency === 'USD').length;
+      const vndCount = salaries.filter(s => s.currency === 'VND').length;
 
       // Skills/locations/companies/modes
       const topSkills = topN(list, j => j.skills || j.tags || [], 10);
@@ -518,6 +658,8 @@ python -m http.server 8000</pre>
           median,
           avg,
           buckets: salBuckets,
+          usdCount,
+          vndCount,
         },
         topSkills, topLocations, topCompanies, modes, fresh, hotCount,
       };
@@ -542,7 +684,7 @@ python -m http.server 8000</pre>
       const topMode = d.modes[0];
       const narrative = [
         `<b>${total}</b> jobs`,
-        d.salary.count ? `<b>${d.salary.count}</b> (${d.salary.pct}%) có salary parseable, trung vị <b>$${fmtUSD(d.salary.median)}</b> USD` : null,
+        d.salary.count ? `<b>${d.salary.count}</b> (${d.salary.pct}%) có salary parseable, trung vị <b>$${fmtUSD(d.salary.median)}</b> USD-equiv (${d.salary.usdCount} USD + ${d.salary.vndCount} VND)` : null,
         topSkill ? `top skill <b>${esc(topSkill[0])}</b> (${topSkill[1]})` : null,
         topLoc ? `chủ yếu ở <b>${esc(topLoc[0])}</b> (${topLoc[1]})` : null,
         topMode ? `working mode phổ biến: <b>${esc(topMode[0])}</b> (${topMode[1]})` : null,
@@ -553,24 +695,27 @@ python -m http.server 8000</pre>
       let salaryHtml;
       if (d.salary.count) {
         const maxCount = Math.max(...d.salary.buckets.map(b => b.count), 1);
-        const bucketRows = d.salary.buckets.map(b => `
-          <div class="bar-row">
-            <span class="name">${esc(b.label)}</span>
-            <span class="bar"><span style="width:${(b.count / maxCount * 100).toFixed(1)}%"></span></span>
-            <span class="count">${b.count}</span>
-          </div>
-        `).join('');
+        const chart = d.salary.buckets.map(b => {
+          const h = b.count ? (b.count / maxCount * 100).toFixed(1) : 0;
+          return `
+            <div class="col" title="${esc(b.label)}: ${b.count} job${b.count !== 1 ? 's' : ''}">
+              <span class="count">${b.count || ''}</span>
+              <div class="col-bar"><div class="bar" style="height:${h}%"></div></div>
+              <span class="label">${esc(b.short)}</span>
+            </div>
+          `;
+        }).join('');
         salaryHtml = `
           <div class="rep-section span-2">
-            <h4>Salary insights</h4>
+            <h4>Salary insights <span class="muted" style="font-weight:normal;text-transform:none;letter-spacing:0">(normalized to USD-equiv, ${fmtUSD(Math.round(usdVndRate))} VND = $1 · ${rateSource})</span></h4>
             <div class="rep-stats">
-              <div class="rep-stat"><span class="rep-stat-label">Parseable</span><span class="rep-stat-value">${d.salary.count} / ${total}</span></div>
+              <div class="rep-stat"><span class="rep-stat-label">Parseable</span><span class="rep-stat-value">${d.salary.count} / ${total}</span><span class="muted" style="font-size:11px">USD:${d.salary.usdCount} · VND:${d.salary.vndCount}</span></div>
               <div class="rep-stat"><span class="rep-stat-label">Min</span><span class="rep-stat-value">$${fmtUSD(d.salary.min)}</span></div>
               <div class="rep-stat"><span class="rep-stat-label">Median (max)</span><span class="rep-stat-value">$${fmtUSD(d.salary.median)}</span></div>
               <div class="rep-stat"><span class="rep-stat-label">Mean (max)</span><span class="rep-stat-value">$${fmtUSD(d.salary.avg)}</span></div>
               <div class="rep-stat"><span class="rep-stat-label">Max</span><span class="rep-stat-value">$${fmtUSD(d.salary.max)}</span></div>
             </div>
-            <div>${bucketRows}</div>
+            <div class="salary-chart">${chart}</div>
           </div>
         `;
       } else {
@@ -646,9 +791,10 @@ python -m http.server 8000</pre>
 
       // Salary
       lines.push(`## Salary`);
+      lines.push(`_All figures normalized to USD-equivalent (${fmtUSD(Math.round(usdVndRate))} VND = $1, source: ${rateSource}${rateFetchedAt ? ' @ ' + rateFetchedAt.toISOString().slice(0, 16) : ''})._`);
       if (d.salary.count) {
-        lines.push(`- **${d.salary.count} / ${d.total}** jobs có salary parseable (${d.salary.pct}%)`);
-        lines.push(`- Range: $${fmtUSD(d.salary.min)} – $${fmtUSD(d.salary.max)} USD`);
+        lines.push(`- **${d.salary.count} / ${d.total}** jobs có salary parseable (${d.salary.pct}%) — USD: ${d.salary.usdCount}, VND: ${d.salary.vndCount}`);
+        lines.push(`- Range: $${fmtUSD(d.salary.min)} – $${fmtUSD(d.salary.max)}`);
         lines.push(`- Median (max): **$${fmtUSD(d.salary.median)}** | Mean (max): $${fmtUSD(d.salary.avg)}`);
         lines.push('');
         lines.push(`### Distribution`);
@@ -846,13 +992,20 @@ python -m http.server 8000</pre>
       renderAll();
     }
 
-    fetch('itviec-jobs.json')
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(data => loadData(data, `itviec-jobs.json · ${data.length} jobs`))
-      .catch(() => {
+    (async () => {
+      // Chạy song song: rate fetch + data fetch (cả 2 độc lập, tiết kiệm ~200ms)
+      const [_, dataResult] = await Promise.allSettled([
+        loadRate(),
+        fetch('itviec-jobs.json')
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
+      ]);
+      if (dataResult.status === 'fulfilled') {
+        loadData(dataResult.value, `itviec-jobs.json · ${dataResult.value.length} jobs`);
+      } else {
         document.getElementById('loader').hidden = true;
         document.getElementById('empty').hidden = false;
-      });
+      }
+    })();
   </script>
 </body>
 </html>

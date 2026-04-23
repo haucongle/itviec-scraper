@@ -1,0 +1,73 @@
+name: Crawl ITviec jobs
+
+# Manual-only trigger: Actions tab → Crawl ITviec jobs → Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # cần để commit + push itviec-jobs.json
+
+# Không chạy song song nếu user bấm Run workflow khi còn run khác đang chạy
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      # Optional: inject login cookies từ secret ITVIEC_COOKIES_RAW (raw Cookie header).
+      # Không set secret → scrape không login, salary sẽ là "Sign in to view salary".
+      - name: Inject login cookies
+        env:
+          COOKIES_RAW: ${{ secrets.ITVIEC_COOKIES_RAW }}
+        run: |
+          if [ -n "$COOKIES_RAW" ]; then
+            printf '%s' "$COOKIES_RAW" > cookies-raw.txt
+            node build-cookies.js
+            echo "✓ Cookies loaded"
+          else
+            echo "⚠ No ITVIEC_COOKIES_RAW secret — scraping không login, salary sẽ bị ẩn."
+          fi
+
+      - name: Crawl
+        run: node scraper.js
+
+      - name: Commit updated jobs.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain itviec-jobs.json)" ]; then
+            git add itviec-jobs.json
+            git commit -m "chore: crawl $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+            echo "✓ Pushed updated jobs.json"
+          else
+            echo "No changes in itviec-jobs.json, nothing to commit."
+          fi
+
+      # Upload debug artifacts khi fail để debug offline
+      - name: Upload state file on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-debug-${{ github.run_id }}
+          path: |
+            itviec-state.json
+            itviec-jobs.json
+          if-no-files-found: ignore
+          retention-days: 7
