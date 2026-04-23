@@ -1,22 +1,24 @@
 name: Crawl ITviec jobs
 
 on:
-  # 00:00 UTC = 07:00 ICT (Asia/Ho_Chi_Minh) mỗi ngày
+  # 00:00 UTC = 07:00 ICT mỗi ngày
   schedule:
     - cron: '0 0 * * *'
-  # Manual trigger: Actions tab → Crawl ITviec jobs → Run workflow
   workflow_dispatch:
 
 permissions:
-  contents: write  # cần để commit + push itviec-jobs.json
+  contents: write
 
-# Không chạy song song nếu user bấm Run workflow khi còn run khác đang chạy
+# Không chạy song song nếu user bấm Run khi còn run khác đang chạy
 concurrency:
   group: crawl
   cancel-in-progress: false
 
 jobs:
-  crawl:
+  # ============ Job 1: Scrape ============
+  # Tách ra để re-run "commit" job độc lập được khi commit fail
+  # (race với user push) mà không cần scrape lại 20 phút.
+  scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -33,8 +35,6 @@ jobs:
       - name: Install Playwright Chromium
         run: npx playwright install chromium --with-deps
 
-      # Optional: inject login cookies từ secret ITVIEC_COOKIES_RAW (raw Cookie header).
-      # Không set secret → scrape không login, salary sẽ là "Sign in to view salary".
       - name: Inject login cookies
         env:
           COOKIES_RAW: ${{ secrets.ITVIEC_COOKIES_RAW }}
@@ -44,15 +44,53 @@ jobs:
             node build-cookies.js
             echo "✓ Cookies loaded"
           else
-            echo "⚠ No ITVIEC_COOKIES_RAW secret — scraping không login, salary sẽ bị ẩn."
+            echo "⚠ No ITVIEC_COOKIES_RAW secret — salary sẽ bị ẩn."
           fi
 
-      # Luôn fresh scrape trên CI — không dùng resume từ state file cũ
       - name: Ensure fresh state
         run: rm -f itviec-state.json
 
       - name: Crawl
         run: node scraper.js
+
+      # Pass jobs.json sang job commit qua artifact. Luôn upload (success + fail)
+      # để re-run commit job có sẵn data.
+      - name: Upload jobs.json artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: itviec-jobs
+          path: itviec-jobs.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-debug-${{ github.run_id }}
+          path: |
+            itviec-state.json
+            itviec-jobs.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ============ Job 2: Commit ============
+  # Chỉ làm 1 việc: checkout repo, pull artifact, git add/commit/push với retry.
+  # Nếu fail → user vào Actions tab → "Re-run failed jobs" → chỉ job này chạy lại,
+  # không scrape lại.
+  commit:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jobs.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: itviec-jobs
 
       - name: Commit updated jobs.json
         run: |
@@ -65,8 +103,7 @@ jobs:
           git add itviec-jobs.json
           git commit -m "chore: crawl $(date -u +%Y-%m-%d) [skip ci]"
           # Rebase trước khi push: user có thể đã push commit khác lên main
-          # trong ~20 phút crawl chạy. `if` wrapper để bash -e không abort khi
-          # push fail (cho retry chạy được). Retry 3 lần.
+          # giữa lúc scrape chạy. `if` wrapper để bash -e không abort sớm.
           for i in 1 2 3; do
             echo "=== Push attempt $i ==="
             git fetch origin main
@@ -77,17 +114,5 @@ jobs:
             echo "⚠ Attempt $i failed, retry in 5s..."
             sleep 5
           done
-          echo "::error::Failed to push after 3 attempts"
+          echo "::error::Failed to push after 3 attempts — re-run this job only when the race with user pushes clears."
           exit 1
-
-      # Upload debug artifacts khi fail để debug offline
-      - name: Upload state file on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: crawl-debug-${{ github.run_id }}
-          path: |
-            itviec-state.json
-            itviec-jobs.json
-          if-no-files-found: ignore
-          retention-days: 7
