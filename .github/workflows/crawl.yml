@@ -58,8 +58,15 @@ jobs:
           if [ -n "$(git status --porcelain itviec-jobs.json)" ]; then
             git add itviec-jobs.json
             git commit -m "chore: crawl $(date -u +%Y-%m-%d) [skip ci]"
-            git push
-            echo "✓ Pushed updated jobs.json"
+            # Rebase trước khi push: user có thể đã push commit khác lên main
+            # trong ~20 phút crawl chạy. Retry 3 lần nếu vẫn race.
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push && { echo "✓ Pushed (attempt $i)"; exit 0; }
+              echo "Attempt $i failed, retry in 5s..."
+              sleep 5
+            done
+            echo "::error::Failed to push after 3 attempts"
+            exit 1
           else
             echo "No changes in itviec-jobs.json, nothing to commit."
           fi
