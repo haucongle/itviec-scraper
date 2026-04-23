@@ -11,9 +11,13 @@ const CONFIG = {
   maxPages: null,        // null = scrape tất cả
   outputFile: 'itviec-jobs.json',
   cookiesFile: 'itviec-cookies.json',
-  headless: false,       // false khi dev, true khi stable
+  stateFile: 'itviec-state.json',  // resume checkpoint; xóa file này để scrape lại từ đầu
+  headless: true,       // false khi dev, true khi stable
   detailConcurrency: 3,  // số detail page parse song song
+  saveEvery: 5,          // save state sau mỗi N detail jobs
 };
+
+const STATE_VERSION = 1;
 
 const sleep = (min, max = min) => new Promise(r => 
   setTimeout(r, min + Math.random() * (max - min))
@@ -253,86 +257,214 @@ async function scrapeJobDetail(context, job) {
   }
 }
 
+// ============ STATE / RESUME ============
+
+function createInitialState() {
+  return {
+    version: STATE_VERSION,
+    phase: 'list',       // 'list' → 'detail' → 'done'
+    totalPages: 0,
+    allJobs: [],         // list-page summaries (deduped by URL)
+    completedPages: [],  // page numbers đã scrape list xong
+    detailed: {},        // url → full job detail
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function loadState() {
+  if (!fs.existsSync(CONFIG.stateFile)) return null;
+  try {
+    const s = JSON.parse(fs.readFileSync(CONFIG.stateFile, 'utf8'));
+    if (s.version !== STATE_VERSION) {
+      console.log(`⚠️ State file version mismatch (${s.version} ≠ ${STATE_VERSION}), bắt đầu lại`);
+      return null;
+    }
+    return s;
+  } catch (err) {
+    console.log(`⚠️ State file corrupt (${err.message}), bắt đầu lại`);
+    return null;
+  }
+}
+
+// Atomic write: tmp → rename để tránh corrupt nếu crash giữa chừng
+function saveState(state) {
+  state.updatedAt = new Date().toISOString();
+  const tmp = CONFIG.stateFile + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, CONFIG.stateFile);
+}
+
+// ============ MAIN ============
+
 async function main() {
   console.time('⏱️ Total time');
+
+  // ============ Load or init state ============
+  let state = loadState();
+  const resuming = !!state;
+  if (resuming) {
+    const detailDone = Object.keys(state.detailed).length;
+    console.log(
+      `📂 Resuming: phase=${state.phase}, ` +
+      `list ${state.completedPages.length}/${state.totalPages || '?'}, ` +
+      `detail ${detailDone}/${state.allJobs.length}`
+    );
+  } else {
+    state = createInitialState();
+    console.log('🆕 Bắt đầu scrape mới (không có state file)');
+  }
+
+  // Nếu lần trước đã xong → chỉ cần re-materialize output
+  if (state.phase === 'done') {
+    const finalJobs = Object.values(state.detailed);
+    fs.writeFileSync(CONFIG.outputFile, JSON.stringify(finalJobs, null, 2));
+    console.log(`✅ State đã done. Re-saved ${finalJobs.length} jobs → ${CONFIG.outputFile}`);
+    console.log(`ℹ️ Xóa ${CONFIG.stateFile} để scrape lại từ đầu.`);
+    console.timeEnd('⏱️ Total time');
+    return;
+  }
+
   const { browser, context } = await setupBrowser();
+
+  // ============ SIGINT: save state trước khi exit ============
+  let shuttingDown = false;
+  const gracefulExit = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n⚠️ Nhận ${signal}, saving state...`);
+    try { saveState(state); } catch (err) { console.error('State save fail:', err.message); }
+    try { await context.storageState({ path: CONFIG.cookiesFile }); } catch {}
+    try { await browser.close(); } catch {}
+    console.log('💾 State saved. Chạy lại scraper để resume.');
+    process.exit(130);
+  };
+  process.on('SIGINT', () => gracefulExit('SIGINT'));
+  process.on('SIGTERM', () => gracefulExit('SIGTERM'));
+
   const page = await context.newPage();
 
-  // ============ STEP 1: Visit homepage để warm up cookies ============
-  console.log('🏠 Visiting homepage...');
-  await page.goto('https://itviec.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await bypassCloudflare(page);
-  await sleep(2000, 4000);
+  // ============ STEP 1: Warmup (chỉ lần đầu) ============
+  if (!resuming) {
+    console.log('🏠 Visiting homepage...');
+    await page.goto('https://itviec.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await bypassCloudflare(page);
+    await sleep(2000, 4000);
+  }
 
-  // ============ STEP 2: Get total page count ============
-  console.log('📊 Detecting total pages...');
-  await page.goto(`${CONFIG.baseUrl}?page=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await bypassCloudflare(page);
-  
-  let totalPages = await detectTotalPages(page);
-  if (CONFIG.maxPages) totalPages = Math.min(totalPages, CONFIG.maxPages);
-  console.log(`📊 Total pages: ${totalPages}`);
+  // ============ STEP 2: Detect total pages (nếu chưa có) ============
+  if (!state.totalPages) {
+    console.log('📊 Detecting total pages...');
+    await page.goto(`${CONFIG.baseUrl}?page=1`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await bypassCloudflare(page);
 
-  // ============ STEP 3: Scrape list pages ============
-  const allJobs = [];
-  const seenUrls = new Set();
+    let totalPages = await detectTotalPages(page);
+    if (CONFIG.maxPages) totalPages = Math.min(totalPages, CONFIG.maxPages);
+    state.totalPages = totalPages;
+    saveState(state);
+  }
+  console.log(`📊 Total pages: ${state.totalPages}`);
 
-  for (let p = 1; p <= totalPages; p++) {
-    console.log(`\n📄 Page ${p}/${totalPages}`);
-    try {
-      const jobs = await scrapeListPage(page, p);
-      
-      // Dedupe
-      const newJobs = jobs.filter(j => !seenUrls.has(j.url));
-      newJobs.forEach(j => seenUrls.add(j.url));
-      allJobs.push(...newJobs);
-      
-      console.log(`  ✓ Got ${jobs.length} jobs (${newJobs.length} new, total: ${allJobs.length})`);
-    } catch (err) {
-      console.error(`  ❌ Page ${p} failed: ${err.message}`);
+  // ============ STEP 3: List phase (skip pages đã xong) ============
+  if (state.phase === 'list') {
+    const completedSet = new Set(state.completedPages);
+    const seenUrls = new Set(state.allJobs.map(j => j.url));
+
+    for (let p = 1; p <= state.totalPages; p++) {
+      if (completedSet.has(p)) continue;
+
+      console.log(`\n📄 Page ${p}/${state.totalPages}`);
+      try {
+        const jobs = await scrapeListPage(page, p);
+        const newJobs = jobs.filter(j => !seenUrls.has(j.url));
+        newJobs.forEach(j => seenUrls.add(j.url));
+        state.allJobs.push(...newJobs);
+        state.completedPages.push(p);
+        saveState(state);
+        console.log(`  ✓ Got ${jobs.length} jobs (${newJobs.length} new, total: ${state.allJobs.length})`);
+      } catch (err) {
+        console.error(`  ❌ Page ${p} failed: ${err.message} (sẽ retry lần resume sau)`);
+      }
+
+      if (p % 5 === 0) {
+        await context.storageState({ path: CONFIG.cookiesFile });
+      }
+      await sleep(1500, 3500);
     }
 
-    // Save cookies mỗi 5 pages
-    if (p % 5 === 0) {
+    // Nếu còn page fail → giữ phase='list' để lần resume sau retry.
+    // Nếu user muốn bỏ qua page fail và force sang detail: edit state.phase = 'detail' trong file.
+    const doneSet = new Set(state.completedPages);
+    const failed = [];
+    for (let p = 1; p <= state.totalPages; p++) {
+      if (!doneSet.has(p)) failed.push(p);
+    }
+    if (failed.length) {
+      console.log(`\n⚠️ ${failed.length} page(s) fail: [${failed.join(',')}]. Chạy lại scraper để retry, hoặc edit ${CONFIG.stateFile} → phase="detail" để bỏ qua.`);
+      await page.close();
       await context.storageState({ path: CONFIG.cookiesFile });
+      await browser.close();
+      console.timeEnd('⏱️ Total time');
+      return;
     }
 
-    await sleep(1500, 3500); // Delay giữa các page
+    state.phase = 'detail';
+    saveState(state);
   }
 
   await page.close();
-  console.log(`\n📊 Total jobs collected: ${allJobs.length}`);
+  console.log(`\n📊 Total jobs collected: ${state.allJobs.length}`);
 
-  // ============ STEP 4: Scrape detail pages (parallel) ============
-  console.log(`\n🔍 Scraping ${allJobs.length} job details...`);
-  const limit = pLimit(CONFIG.detailConcurrency);
-  const detailed = [];
-  let done = 0;
+  // ============ STEP 4: Detail phase (skip URLs đã scrape) ============
+  if (state.phase === 'detail') {
+    const todo = state.allJobs.filter(j => !state.detailed[j.url]);
+    const alreadyDone = state.allJobs.length - todo.length;
+    console.log(`\n🔍 Scraping ${todo.length} details (${alreadyDone} đã có từ lần trước)`);
 
-  const tasks = allJobs.map(job => limit(async () => {
-    try {
-      await sleep(500, 1500);
-      const detail = await scrapeJobDetail(context, job);
-      detailed.push(detail);
-      done++;
-      if (done % 10 === 0) {
-        console.log(`  Progress: ${done}/${allJobs.length}`);
+    const limit = pLimit(CONFIG.detailConcurrency);
+    let done = 0;
+    let lastSaveAt = 0;
+
+    const tasks = todo.map(job => limit(async () => {
+      if (shuttingDown) return;
+      try {
+        await sleep(500, 1500);
+        const detail = await scrapeJobDetail(context, job);
+        state.detailed[job.url] = detail;
+      } catch (err) {
+        console.error(`  ❌ ${job.title.slice(0, 40)}: ${err.message}`);
+        state.detailed[job.url] = job; // fallback: basic data từ list
       }
-    } catch (err) {
-      console.error(`  ❌ ${job.title.slice(0, 40)}: ${err.message}`);
-      detailed.push(job); // giữ lại data cơ bản nếu detail fail
-    }
-  }));
+      done++;
+      if (done - lastSaveAt >= CONFIG.saveEvery) {
+        saveState(state);
+        lastSaveAt = done;
+      }
+      if (done % 10 === 0) {
+        console.log(`  Progress: ${done}/${todo.length} (total done: ${Object.keys(state.detailed).length}/${state.allJobs.length})`);
+      }
+    }));
 
-  await Promise.all(tasks);
+    await Promise.all(tasks);
+    saveState(state);
 
-  // ============ STEP 5: Save + cleanup ============
+    state.phase = 'done';
+    saveState(state);
+  }
+
+  // ============ STEP 5: Final output + cleanup ============
   await context.storageState({ path: CONFIG.cookiesFile });
   await browser.close();
 
-  fs.writeFileSync(CONFIG.outputFile, JSON.stringify(detailed, null, 2));
-  console.log(`\n✅ Saved ${detailed.length} jobs to ${CONFIG.outputFile}`);
+  const finalJobs = Object.values(state.detailed);
+  fs.writeFileSync(CONFIG.outputFile, JSON.stringify(finalJobs, null, 2));
+  console.log(`\n✅ Saved ${finalJobs.length} jobs to ${CONFIG.outputFile}`);
+  console.log(`ℹ️ ${CONFIG.stateFile} vẫn giữ lại. Xóa nó nếu muốn scrape lại từ đầu.`);
   console.timeEnd('⏱️ Total time');
 }
 
-main().catch(console.error);
+main().catch(err => {
+  console.error('💥 Fatal:', err);
+  console.log(`ℹ️ State đã được save tới page/job cuối cùng trước lỗi. Chạy lại để resume.`);
+  process.exit(1);
+});
