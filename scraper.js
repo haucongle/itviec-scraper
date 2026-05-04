@@ -250,6 +250,8 @@ async function scrapeJobDetail(context, job) {
   try {
     await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await bypassCloudflare(page);
+    // Wait cho main column của job page render — tránh case page trả về fallback/redirect khiến title bị parse thành "itviec.com"
+    await page.waitForSelector('.col-xl-8.im-0 h1', { timeout: 15000 });
     const html = await page.content();
     return parseJobDetail(html, job);
   } finally {
